@@ -59,6 +59,7 @@ data/screenshots/
 data/*.db
 data/*.sqlite
 data/*.sqlite3
+data/*.json
 playwright-report/
 test-results/
 .playwright/
