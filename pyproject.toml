@@ -28,6 +28,7 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
     "ruff>=0.16.10",
+    "streamlit>=1.65.0",
 ]
 
 [tool.ruff]
