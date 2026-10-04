@@ -46,7 +46,7 @@ async def demo_single_step() -> None:
     print("\n结果:")
     print(f"  final_result: {final[:200]}")
     print(f"  截图 bytes:   {len(screenshot_b64)} (base64)")
-    print(f"  截图落盘:    screenshots/step_000_*.png")
+    print("  截图落盘:    screenshots/step_000_*.png")
 
 
 async def demo_run_plan() -> None:
