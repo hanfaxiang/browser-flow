@@ -12,11 +12,16 @@ import os
 import pytest
 
 from browser_flow.agents.planning import (
+    REFINITION_PROMPT,
     SYSTEM_PROMPT,
+    PlanningState,
     TaskPlan,
     _extract_json,
     aplan,
+    aplan_with_feedback,
     plan,
+    plan_with_feedback,
+    planning_node,
 )
 
 # ---- 纯逻辑:JSON 抽取 ----
@@ -118,3 +123,61 @@ def test_system_prompt_has_key_sections() -> None:
     """SYSTEM_PROMPT 必备的 4 个关键字:拆分原则 / 步骤数 / 单一动作 / 示例。"""
     for kw in ("拆分原则", "3-8", "单一浏览器动作", "示例"):
         assert kw in SYSTEM_PROMPT, f"SYSTEM_PROMPT 缺少关键字: {kw}"
+
+
+# ---- Day 9: 多轮反馈 ----
+
+
+class TestRefinementPrompt:
+    def test_refinement_prompt_has_placeholders(self) -> None:
+        for ph in ("{user_task}", "{previous_plan}", "{feedback}"):
+            assert ph in REFINITION_PROMPT, f"REFINITION_PROMPT 缺少 {ph}"
+
+
+@pytest.mark.skipif(not HAS_KEY, reason="需要 DEEPSEEK_API_KEY 或 OPENAI_API_KEY")
+class TestPlanningFeedback:
+    @pytest.mark.asyncio
+    async def test_aplan_with_feedback_split_finer(self) -> None:
+        """原计划 5 步,反馈"再拆细",应得到 ≥5 步。"""
+        original = await aplan("打开京东搜索 iPhone 提取价格")
+
+        refined = await aplan_with_feedback(
+            user_task="打开京东搜索 iPhone 提取价格",
+            previous=original,
+            feedback="把'抓取商品'拆细:分两条,一条抓标题和价格,一条抓详情页评分",
+        )
+
+        assert len(refined.sub_tasks) >= len(original.sub_tasks)
+        assert refined.estimated_steps >= original.estimated_steps
+
+    def test_plan_with_feedback_sync(self) -> None:
+        """同步 plan_with_feedback 可用。"""
+        first = plan("打开百度")
+        second = plan_with_feedback(
+            user_task="打开百度",
+            previous=first,
+            feedback="把打开步骤合并掉,只要一步",
+        )
+        assert isinstance(second, TaskPlan)
+
+
+# ---- Day 9: LangGraph State + 节点 ----
+
+
+class TestPlanningState:
+    def test_typed_dict_fields(self) -> None:
+        """PlanningState 暴露关键字段。"""
+        state: PlanningState = {
+            "user_task": "打开百度",
+            "sub_tasks": ["打开 baidu.com"],
+            "current_step": 0,
+            "estimated_steps": 1,
+        }
+        assert state["user_task"] == "打开百度"
+        assert "planning_history" not in state  # total=False 时可选
+
+    def test_planning_node_returns_partial(self) -> None:
+        """planning_node 输入空 user_task 返回安全降级。"""
+        result = planning_node({"user_task": ""})  # type: ignore[typeddict-item]
+        assert result["sub_tasks"] == []
+        assert result["estimated_steps"] == 0

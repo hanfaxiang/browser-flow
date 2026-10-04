@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import Any
+from typing import Any, TypedDict
 
 from browser_use.llm.messages import SystemMessage, UserMessage
 from pydantic import BaseModel, Field
@@ -72,6 +72,24 @@ JSON 结构:
   "estimated_steps": 5,
   "rationale": "需要登录 + 多页跳转的复杂流程"
 }
+"""
+
+REFINITION_PROMPT = """你之前给出的拆解被要求调整。
+
+原任务: {user_task}
+
+原拆解:
+{previous_plan}
+
+用户反馈: {feedback}
+
+请根据反馈调整,重新输出严格 JSON(同样的结构)。只输出 JSON,不要其他文字。
+
+调整指南:
+- "再拆细点" / "太粗了" : 把合并的步骤拆成多步(单一动作)
+- "合并" / "太碎了" : 把连续的小步骤合为一步
+- "加上 XX 步" / "漏了 XX" : 在合适位置插入新步骤
+- "去掉 XX" : 删除冗余步骤
 """
 
 
@@ -148,3 +166,134 @@ async def aplan(user_task: str) -> TaskPlan:
 def plan(user_task: str) -> TaskPlan:
     """同步入口:内部用 asyncio.run 包装 aplan()。"""
     return asyncio.run(aplan(user_task))
+
+
+async def aplan_with_feedback(
+    user_task: str,
+    previous: TaskPlan,
+    feedback: str,
+) -> TaskPlan:
+    """基于上一版拆解 + 用户反馈再拆一轮。
+
+    用法:
+        plan = await aplan("打开京东搜索 iPhone")
+        plan2 = await aplan_with_feedback(
+            user_task="打开京东搜索 iPhone",
+            previous=plan,
+            feedback="把'抓取商品'这一步再拆细:进详情页、看价格、看评论、保存",
+        )
+
+    Args:
+        user_task: 原始用户任务。
+        previous: 上一版 TaskPlan。
+        feedback: 用户给的具体调整意见。
+
+    Raises:
+        RuntimeError: LLM 返回无法解析为 TaskPlan。
+    """
+    llm = get_llm()
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        UserMessage(
+            content=REFINITION_PROMPT.format(
+                user_task=user_task,
+                previous_plan=previous.model_dump_json(indent=2),
+                feedback=feedback,
+            )
+        ),
+    ]
+
+    response = await llm.ainvoke(messages)
+    content = response.completion if hasattr(response, "completion") else str(response)
+
+    try:
+        raw = _extract_json(content)
+        return TaskPlan.model_validate(raw)
+    except (ValueError, Exception) as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"Planning Agent 反馈调整后输出无法解析:\n"
+            f"  原始输出: {content[:500]}\n"
+            f"  错误: {exc}"
+        ) from exc
+
+
+def plan_with_feedback(user_task: str, previous: TaskPlan, feedback: str) -> TaskPlan:
+    """同步入口:aplan_with_feedback 的 asyncio.run 包装。"""
+    return asyncio.run(aplan_with_feedback(user_task, previous, feedback))
+
+
+class PlanningState(TypedDict, total=False):
+    """LangGraph State 里的 Planning 字段子集。
+
+    用法(给 Day 12 Supervisor 拼图用):
+        from typing import TypedDict
+        from langgraph.graph import StateGraph
+
+        class FullState(PlanningState, BrowserState, ExtractionState):
+            pass
+
+    字段:
+        user_task: 原始用户任务(输入)
+        sub_tasks: 当前生效的子任务列表(随反馈 / 重规划更新)
+        current_step: 当前执行到第几个子任务(0-indexed)
+        estimated_steps: 预估总步数
+        rationale: 当前拆解的理由
+        planning_history: 历次规划结果(给回放 / 调试用)
+    """
+
+    user_task: str
+    sub_tasks: list[str]
+    current_step: int
+    estimated_steps: int
+    rationale: str
+    planning_history: list[dict[str, Any]]
+
+
+# LangGraph 节点函数:接收 State -> 更新 State
+
+
+def planning_node(state: PlanningState) -> dict[str, Any]:
+    """LangGraph 节点:对 state['user_task'] 做规划,返回更新字典。
+
+    处理嵌套事件循环:
+        - 在主线程直接调用 -> 用同步 plan() 包装 asyncio.run
+        - 在已有 event loop 里(常见:LangGraph ainvoke / async test)
+          -> 走 _plan_sync_threadsafe,避免 RuntimeError
+
+    如果你的图是纯 async,自己写 `async def aplanning_node(state)` 包 aplan()。
+    """
+    user_task = state.get("user_task", "")
+    if not user_task:
+        return {"sub_tasks": [], "estimated_steps": 0, "rationale": "no task"}
+
+    plan_obj = _plan_smart(user_task)
+    return {
+        "user_task": user_task,
+        "sub_tasks": plan_obj.sub_tasks,
+        "current_step": 0,
+        "estimated_steps": plan_obj.estimated_steps,
+        "rationale": plan_obj.rationale,
+        "planning_history": state.get("planning_history", []) + [plan_obj.model_dump()],
+    }
+
+
+def _plan_smart(user_task: str) -> TaskPlan:
+    """优先在当前 event loop 里跑;没在 loop 里就 asyncio.run。"""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # 不在 loop 里,直接同步跑
+        return asyncio.run(aplan(user_task))
+
+    # 在 loop 里,改用 nest_asyncio 或阻塞到后台线程跑
+    try:
+        import nest_asyncio  # type: ignore[import-not-found]
+
+        nest_asyncio.apply()
+        return asyncio.run(aplan(user_task))
+    except ImportError:
+        # 没装 nest_asyncio,退到线程池
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            return ex.submit(lambda: asyncio.run(aplan(user_task))).result()
